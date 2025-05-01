@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import numpy as np
 import pickle
+import os
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
@@ -13,8 +14,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 def parse_arguments():
     p = argparse.ArgumentParser()
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--ckpt', type=str, default=None)
+    p.add_argument('--seed', type=int, default=42, help='Random seed')
+    p.add_argument('--ckpt', type=str, default=None, help='Checkpoint for evaluation')
     return p.parse_args()
 
 class BindingAffinityPredictor(nn.Module):
@@ -58,6 +59,12 @@ class BindingAffinityData(Dataset):
         y = torch.tensor(self.target_dict[name]).unsqueeze(-1).to(device='cuda')
         return x, y
 
+def load_data(output_path, binding_dict):
+    outputs = torch.load(output_path)
+    affinities = {k: v for k, v in binding_dict.items() if k in outputs['names']}
+    s = pad_sequence([s.squeeze() for s in outputs['s_pre_struct']], batch_first=True)
+    return s, outputs['names'], affinities
+
 def train_model(model, criterion, optimizer, train_loader, valid_loader, num_epochs, early_stopping_patience):
     best_loss = float('inf')
     epochs_no_improve = 0
@@ -83,7 +90,7 @@ def train_model(model, criterion, optimizer, train_loader, valid_loader, num_epo
 
         train_loss = running_loss / len(train_loader)
         val_loss = val_running_loss / len(valid_loader)
-        log(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss}, Valid Loss: {val_loss}')
+        log(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Valid Loss: {val_loss:.4f}')
 
         if val_loss < best_loss:
             best_loss = val_loss
@@ -125,62 +132,63 @@ if __name__ == '__main__':
     learning_rate = 0.01
     num_epochs = 1000
     patience = 50
+    base_dir = 'checkpoints/quickbind_default'
+    save_dir = f'{base_dir}/binding_affinity_prediction'
 
-    log('Getting binding affinity data.')
+    log('Loading binding affinity data.')
     with open('data/binding_affinity_dict.pkl', 'rb') as f:
         binding_affinity_dict = pickle.load(f)
 
-    if not args.ckpt:
-        log('Getting training data.')
-        train_outputs = torch.load(
-            'checkpoints/quickbind_default/train_predictions-w-single-rep.pt'
+    is_train_mode = args.ckpt is None
+    if is_train_mode:
+        log('Loading training data.')
+        train_s, train_names, train_affinities = load_data(
+            f'{base_dir}/train_predictions-w-single-rep.pt', 
+            binding_affinity_dict
         )
-        train_affinities = {k: v for k, v in binding_affinity_dict.items() if k in train_outputs['names']}
-        train_s= pad_sequence([s.squeeze() for s in train_outputs['s_pre_struct']], batch_first=True)
-        train_dataset = BindingAffinityData(train_s, train_outputs['names'], train_affinities)
+        train_dataset = BindingAffinityData(train_s, train_names, train_affinities)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
     
-        log('Getting validation data.')
-        val_outputs = torch.load(
-            'checkpoints/quickbind_default/val_predictions-w-single-rep.pt'
+        log('Loading validation data.')
+        valid_s, valid_names, valid_affinities = load_data(
+            f'{base_dir}/val_predictions-w-single-rep.pt',
+            binding_affinity_dict
         )
-        valid_affinities = {k: v for k, v in binding_affinity_dict.items() if k in val_outputs['names']}
-        valid_s= pad_sequence([s.squeeze() for s in val_outputs['s_pre_struct']], batch_first=True)
-        valid_dataset = BindingAffinityData(valid_s, val_outputs['names'], valid_affinities)
+        valid_dataset = BindingAffinityData(valid_s, valid_names, valid_affinities)
         valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
         
-    log('Getting test data.')
-    test_outputs = torch.load(
-        'checkpoints/quickbind_default/predictions-w-single-rep.pt'
+    log('Loading test data.')
+    test_s, test_names, test_affinities = load_data(
+        f'{base_dir}/predictions-w-single-rep.pt',
+        binding_affinity_dict
     )
-    test_affinities = {k: v for k, v in binding_affinity_dict.items() if k in test_outputs['names']}
-    test_s= pad_sequence([s.squeeze() for s in test_outputs['s_pre_struct']], batch_first=True)
-    test_dataset = BindingAffinityData(test_s, test_outputs['names'], test_affinities)
+    test_dataset = BindingAffinityData(test_s, test_names, test_affinities)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     model = BindingAffinityPredictor(64)
 
-    if not args.ckpt:
+    if is_train_mode:
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         log('Starting model training.')
         train_model(model, criterion, optimizer, train_loader, valid_loader, num_epochs, patience)
         model.load_state_dict(torch.load('curr_ckpt.pt'))
     else:
+        log(f'Loading model from checkpoint: {args.ckpt}')
         model.load_state_dict(torch.load(args.ckpt))
 
-    log('Starting model evaluation.')
+    log('Evaluating model on test data.')
     predictions, true_values = get_predictions(model, test_loader)
-
     rmsd, pearson_corr, spearman_corr, mae = compute_metrics(true_values, predictions)
     
-    log(f'RMSD: {rmsd}')
-    log(f'Pearson Correlation: {pearson_corr}')
-    log(f'Spearman Correlation: {spearman_corr}')
-    log(f'MAE: {mae}')
+    log(f'RMSD: {rmsd:.4f}')
+    log(f'Pearson Correlation: {pearson_corr:.4f}')
+    log(f'Spearman Correlation: {spearman_corr:.4f}')
+    log(f'MAE: {mae:.4f}')
 
-    if not args.ckpt:
-        torch.save(
-            model.state_dict(),
-            f'checkpoints/quickbind_default/binding_affinity_prediction/ckpt_seed{args.seed}.pt'
-        )
+    if is_train_mode:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        save_path = f'{save_dir}/ckpt_seed{args.seed}.pt'
+        torch.save(model.state_dict(), save_path)
+        log(f'Model saved to {save_path}')
